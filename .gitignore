@@ -8,3 +8,9 @@
 *.tmp
 *.swp
 *.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+agent_env
+!README.txt
+*.env*
