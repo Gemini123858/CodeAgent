@@ -14,3 +14,4 @@ __pycache__/
 agent_env
 !README.txt
 *.env*
+demo/
