@@ -44,11 +44,26 @@ class Workspace:
                 f"路径超出工作目录：{path}"
             ) from exc
 
-        if ".git" in relative.parts:
-            raise ProtectedPathError("不允许直接操作 .git 目录。")
+        protected = next(
+            (part for part in relative.parts if self._is_protected_name(part)),
+            None,
+        )
+        if protected is not None:
+            raise ProtectedPathError(f"不允许直接操作受保护路径：{protected}")
         if must_exist and not resolved.exists():
             raise WorkspaceError(f"路径不存在：{path}")
         return resolved
 
     def display(self, path: Path) -> str:
         return str(path.relative_to(self.root)) or "."
+
+    @staticmethod
+    def _is_protected_name(name: str) -> bool:
+        return name == ".git" or name == "agent_env" or name.startswith(".env")
+
+    def is_protected(self, path: Path) -> bool:
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError:
+            return True
+        return any(self._is_protected_name(part) for part in relative.parts)

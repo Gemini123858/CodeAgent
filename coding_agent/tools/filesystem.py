@@ -30,7 +30,11 @@ class FileTools:
 
         try:
             entries = sorted(
-                (entry for entry in directory.iterdir() if entry.name != ".git"),
+                (
+                    entry
+                    for entry in directory.iterdir()
+                    if not self.workspace.is_protected(entry)
+                ),
                 key=lambda entry: (entry.is_file(), entry.name.lower()),
             )
         except OSError as exc:

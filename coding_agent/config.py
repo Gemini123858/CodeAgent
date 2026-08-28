@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MAX_STEPS = 12
 
 
 class ConfigurationError(RuntimeError):
@@ -17,6 +18,7 @@ class Settings:
     api_key: str
     base_url: str
     model: str
+    max_steps: int = DEFAULT_MAX_STEPS
 
 
 def load_settings() -> Settings:
@@ -29,13 +31,21 @@ def load_settings() -> Settings:
 
     base_url = os.getenv("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
     model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip()
+    raw_max_steps = os.getenv("CODING_AGENT_MAX_STEPS", str(DEFAULT_MAX_STEPS))
     if not base_url:
         raise ConfigurationError("DEEPSEEK_BASE_URL 不能为空。")
     if not model:
         raise ConfigurationError("DEEPSEEK_MODEL 不能为空。")
+    try:
+        max_steps = int(raw_max_steps)
+    except ValueError as exc:
+        raise ConfigurationError("CODING_AGENT_MAX_STEPS 必须是整数。") from exc
+    if max_steps <= 0:
+        raise ConfigurationError("CODING_AGENT_MAX_STEPS 必须大于 0。")
 
     return Settings(
         api_key=api_key,
         base_url=base_url,
         model=model,
+        max_steps=max_steps,
     )
