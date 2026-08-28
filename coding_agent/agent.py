@@ -2,20 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from .chat_protocol import (
     ChatProtocolError,
     assistant_message,
-    parse_function_arguments,
     tool_message,
     tool_result_payload,
 )
 from .context import ConversationContext, FullHistoryContext
 from .debug import DebugPrinter
 from .llm_client import LLMClient
-from .tools import ToolRegistry, ToolResult
-from .tools.definitions import tool_definitions
+from .request_builder import RequestBuilder
+from .tool_middleware import ToolExecution, ToolExecutionMiddleware
+from .tools import ToolRegistry
 
 
 SYSTEM_PROMPT = """你是一个本地编程智能体。请使用工具完成用户交给你的任务。
@@ -27,6 +27,31 @@ ContextFactory = Callable[[], ConversationContext]
 ProgressCallback = Callable[[str], None]
 
 
+class TurnRecorder(Protocol):
+    """Persistence boundary used by the runner without coupling it to SQLite."""
+
+    def record_model_response(self, turn_id: int, step: int, response: Any) -> None: ...
+
+    def record_model_error(self, turn_id: int, step: int, error: Exception) -> None: ...
+
+    def record_assistant_message(
+        self,
+        conversation_id: str,
+        turn_id: int,
+        message: dict[str, Any],
+    ) -> None: ...
+
+    def record_tool_exchange(
+        self,
+        conversation_id: str,
+        turn_id: int,
+        step: int,
+        assistant: dict[str, Any],
+        executions: list[ToolExecution],
+        tool_messages: list[dict[str, Any]],
+    ) -> None: ...
+
+
 class AgentError(RuntimeError):
     """Base class for task-level agent failures."""
 
@@ -35,14 +60,12 @@ class MaxStepsExceeded(AgentError):
     """Raised when the agent does not finish within the configured limit."""
 
 
-@dataclass(frozen=True)
-class ToolExecution:
-    step: int
-    tool_call_id: str
-    tool_name: str
-    raw_arguments: str
-    arguments: dict[str, Any] | None
-    result: ToolResult
+class ToolCallLimitExceeded(AgentError):
+    """Raised before a tool batch would exceed the per-turn call limit."""
+
+
+class ModelOutputTruncated(AgentError):
+    """Raised when the model stops because its output limit was reached."""
 
 
 @dataclass(frozen=True)
@@ -61,63 +84,104 @@ class AgentRunner:
         registry: ToolRegistry,
         *,
         max_steps: int = 12,
+        max_tool_calls: int = 32,
         context_factory: ContextFactory | None = None,
+        request_builder: RequestBuilder | None = None,
+        middleware: ToolExecutionMiddleware | None = None,
         debug: DebugPrinter | None = None,
         progress: ProgressCallback | None = None,
     ) -> None:
         if max_steps <= 0:
             raise ValueError("max_steps 必须大于 0。")
+        if max_tool_calls <= 0:
+            raise ValueError("max_tool_calls 必须大于 0。")
         self.llm = llm
         self.registry = registry
         self.max_steps = max_steps
+        self.max_tool_calls = max_tool_calls
         self.context_factory = context_factory or FullHistoryContext
+        self.request_builder = request_builder or RequestBuilder(SYSTEM_PROMPT)
+        self.middleware = middleware or ToolExecutionMiddleware(registry)
         self.debug = debug or DebugPrinter()
         self.progress = progress
 
-    def run(self, task: str) -> AgentOutcome:
+    def run(
+        self,
+        task: str,
+        *,
+        initial_messages: list[dict[str, Any]] | None = None,
+        recorder: TurnRecorder | None = None,
+        conversation_id: str | None = None,
+        turn_id: int | None = None,
+    ) -> AgentOutcome:
+        self._validate_recording_arguments(recorder, conversation_id, turn_id)
         context = self.context_factory()
-        context.extend(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": task},
-            ]
-        )
-        tools = tool_definitions()
+        if initial_messages is None:
+            context.append({"role": "user", "content": task})
+        else:
+            context.extend(initial_messages)
+
         executions: list[ToolExecution] = []
+        tool_call_count = 0
 
         for step in range(1, self.max_steps + 1):
             self._progress(f"[step {step}/{self.max_steps}] 请求模型...")
-            request_messages = context.messages_for_request()
+            request = self.request_builder.build(
+                context,
+                current_user_input=task,
+            )
             self.debug.log(
                 f"agent.request.{step}",
                 {
                     "context_strategy": context.strategy_name,
                     "retained_messages": context.message_count,
-                    "messages": request_messages,
-                    "tools": tools,
-                    "tool_choice": "auto",
+                    "messages": request.messages,
+                    "tools": request.tools,
+                    "tool_choice": request.tool_choice,
                     "thinking": "disabled",
                 },
             )
 
-            response = self.llm.complete(
-                messages=request_messages,
-                tools=tools,
-                tool_choice="auto",
-            )
+            try:
+                response = self.llm.complete(
+                    messages=request.messages,
+                    tools=request.tools or None,
+                    tool_choice=request.tool_choice if request.tools else None,
+                )
+            except Exception as exc:
+                if recorder is not None and turn_id is not None:
+                    recorder.record_model_error(turn_id, step, exc)
+                raise
+
             self.debug.log(f"agent.response.{step}", response)
+            if recorder is not None and turn_id is not None:
+                recorder.record_model_response(turn_id, step, response)
 
             choice = response.choices[0]
             message = choice.message
             try:
-                context.append(assistant_message(message))
+                serialized_assistant = assistant_message(message)
             except ChatProtocolError as exc:
                 raise AgentError(str(exc)) from exc
 
-            tool_calls = message.tool_calls or []
+            tool_calls = list(message.tool_calls or [])
             if not tool_calls:
-                if getattr(choice, "finish_reason", None) == "length":
-                    raise AgentError("模型输出达到长度上限，任务未确认完成。")
+                context.append(serialized_assistant)
+                if recorder is not None:
+                    recorder.record_assistant_message(
+                        conversation_id,
+                        turn_id,
+                        serialized_assistant,
+                    )
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason == "length":
+                    raise ModelOutputTruncated(
+                        "模型输出达到长度上限，任务未确认完成。"
+                    )
+                if finish_reason not in {None, "stop"}:
+                    raise AgentError(
+                        f"模型以非正常原因停止：{finish_reason}。"
+                    )
                 if not message.content:
                     raise AgentError("模型既没有调用工具，也没有返回最终文本。")
                 return AgentOutcome(
@@ -128,49 +192,105 @@ class AgentRunner:
                     retained_messages=context.message_count,
                 )
 
-            for call in tool_calls:
-                execution = self._execute_tool(step, call)
-                executions.append(execution)
-                context.append(tool_message(call.id, execution.result))
+            if tool_call_count + len(tool_calls) > self.max_tool_calls:
+                reason = (
+                    f"本轮工具调用将超过上限 {self.max_tool_calls}，"
+                    "因此整批调用均未执行。"
+                )
+                batch = [
+                    self.middleware.skipped(step, call, reason)
+                    for call in tool_calls
+                ]
+                self._record_tool_batch(
+                    context,
+                    serialized_assistant,
+                    batch,
+                    recorder=recorder,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    step=step,
+                )
+                executions.extend(batch)
+                raise ToolCallLimitExceeded(reason)
+
+            batch = [self.middleware.execute(step, call) for call in tool_calls]
+            self._record_tool_batch(
+                context,
+                serialized_assistant,
+                batch,
+                recorder=recorder,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                step=step,
+            )
+            executions.extend(batch)
+            tool_call_count += len(batch)
+            for execution in batch:
                 status = "成功" if execution.result.ok else "失败"
                 self._progress(
-                    f"[step {step}] 工具 {execution.tool_name}：{status}"
+                    f"[step {step}] 工具 {execution.tool_name}：{status} "
+                    f"({execution.duration_ms:.1f} ms)"
                 )
 
         raise MaxStepsExceeded(
             f"达到最大步骤数 {self.max_steps}，任务仍未返回最终答案。"
         )
 
-    def _execute_tool(self, step: int, call: Any) -> ToolExecution:
-        if call.type != "function":
-            raise AgentError(f"不支持的工具调用类型：{call.type}")
+    def _record_tool_batch(
+        self,
+        context: ConversationContext,
+        assistant: dict[str, Any],
+        executions: list[ToolExecution],
+        *,
+        recorder: TurnRecorder | None,
+        conversation_id: str | None,
+        turn_id: int | None,
+        step: int,
+    ) -> None:
+        tool_messages = [
+            tool_message(execution.tool_call_id, execution.result)
+            for execution in executions
+        ]
+        # One protocol unit: an assistant tool-call message followed by one
+        # result for every call id.
+        context.extend([assistant, *tool_messages])
+        if recorder is not None:
+            recorder.record_tool_exchange(
+                conversation_id,
+                turn_id,
+                step,
+                assistant,
+                executions,
+                tool_messages,
+            )
+        for execution in executions:
+            self.debug.log(
+                f"agent.tool.{step}.{execution.tool_call_id}",
+                {
+                    "name": execution.tool_name,
+                    "raw_arguments": execution.raw_arguments,
+                    "parsed_arguments": execution.arguments,
+                    "status": execution.status,
+                    "duration_ms": execution.duration_ms,
+                    "result": tool_result_payload(execution.result),
+                },
+            )
 
-        raw_arguments = call.function.arguments
-        try:
-            arguments = parse_function_arguments(raw_arguments)
-            result = self.registry.execute(call.function.name, arguments)
-        except ChatProtocolError as exc:
-            arguments = None
-            result = ToolResult.failure(str(exc))
-
-        execution = ToolExecution(
-            step=step,
-            tool_call_id=call.id,
-            tool_name=call.function.name,
-            raw_arguments=raw_arguments,
-            arguments=arguments,
-            result=result,
+    @staticmethod
+    def _validate_recording_arguments(
+        recorder: TurnRecorder | None,
+        conversation_id: str | None,
+        turn_id: int | None,
+    ) -> None:
+        supplied = (
+            recorder is not None,
+            conversation_id is not None,
+            turn_id is not None,
         )
-        self.debug.log(
-            f"agent.tool.{step}.{call.id}",
-            {
-                "name": execution.tool_name,
-                "raw_arguments": execution.raw_arguments,
-                "parsed_arguments": execution.arguments,
-                "result": tool_result_payload(execution.result),
-            },
-        )
-        return execution
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "持久化运行必须同时提供 recorder、conversation_id 和 turn_id。"
+            )
 
     def _progress(self, message: str) -> None:
         if self.progress is not None:

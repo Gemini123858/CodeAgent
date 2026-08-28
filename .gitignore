@@ -9,6 +9,7 @@
 *.swp
 *.DS_Store
 .venv/
+.coding-agent/
 __pycache__/
 *.py[cod]
 agent_env

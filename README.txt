@@ -1,29 +1,26 @@
 Python Coding Agent
 
-项目目标是自行实现一个轻量级本地 Coding Agent，不使用任何 Agent 框架。
+一个不依赖 Agent 框架的本地 Coding Agent，使用 DeepSeek 的 OpenAI 兼容接口。当前支持多步工具循环、多轮会话、SQLite 持久化、DEBUG 日志，以及 list_files、read_file、write_file、run_command 四个工作区工具。
 
-当前进度：已完成 DeepSeek 对话、本地工具和单次任务 Agent 循环。模型可反复调用 list_files、read_file、write_file、run_command，程序执行并回传结果，直到模型输出最终答案。当前上下文策略 FullHistoryContext 会保留并重发完整历史，后续可替换为截断或摘要策略。
-
-WSL Ubuntu 22.04 启动：
+WSL Ubuntu 22.04：
 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 export DEEPSEEK_API_KEY='你的 Key'
-python -m coding_agent "请用一句话介绍你自己"
 
-独立测试本地工具：
+启动多轮会话：
 
-mkdir -p demo
-python -m coding_agent.tools --workspace ./demo write-file hello.py --content "print('hello')"
-python -m coding_agent.tools --workspace ./demo list-files
+python -m coding_agent --session --workspace ./demo --debug
 
-测试单次任务闭环：
+会话命令：/new [标题]、/resume <ID>、/list、/help、/exit。会话数据保存在工作区的 .coding-agent/state.db，该目录不会暴露给模型工具。
 
-python -m coding_agent --agent --workspace ./demo --max-steps 12 --debug "创建 hello.py 并运行"
+执行一次持久化任务：
 
-也可设置 CODING_AGENT_DEBUG=1 和 CODING_AGENT_MAX_STEPS=12。调试输出每步请求、响应和工具结果，并隐藏 API Key 与 reasoning_content。当前关闭 DeepSeek 思考模式。
+python -m coding_agent --agent --workspace ./demo "创建 hello.py 并运行"
 
-文件工具限制在指定工作区并保护 .git、.env 等路径；命令工具不启用 Shell、限制命令并移除敏感环境变量，但仍不是操作系统级沙箱。
+可用 --max-steps 和 --max-tool-calls 设置单轮上限，也可设置 CODING_AGENT_MAX_STEPS、CODING_AGENT_MAX_TOOL_CALLS、CODING_AGENT_DEBUG。
 
-Git 仓库地址：待补充
+每次请求由 RequestBuilder 重新构造完整历史和工具；当前传入全部工具，已预留 EmbeddingProvider/EmbeddingToolSelector。工具失败会作为 error 工具消息保留，让模型下一步修正；调用超限时整批跳过并补齐对应结果；API 失败和步骤超限均记录 Turn 状态。回滚尚未实现，因此不会删除可能已产生副作用的失败轮次。
+
+工具只允许访问指定工作区并保护 .git、.env、.coding-agent；命令执行不启用 Shell、限制命令并移除敏感环境变量，但不等同于操作系统级沙箱。
