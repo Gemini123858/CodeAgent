@@ -105,7 +105,37 @@ class FileTools:
             f"{action}文件：{self.workspace.display(file_path)}",
             path=self.workspace.display(file_path),
             bytes=len(encoded),
+            change_type="modified" if existed else "created",
+            existed_before=existed,
         )
+
+    def delete_file(self, path: str) -> ToolResult:
+        file_path = self._resolve(path, must_exist=True)
+        raw_path = Path(path)
+        lexical_path = (
+            raw_path if raw_path.is_absolute() else self.workspace.root / raw_path
+        )
+        if lexical_path.is_symlink():
+            raise FileToolError("不允许删除符号链接。")
+        if not file_path.is_file():
+            raise FileToolError(f"只能删除普通文件：{path}")
+
+        try:
+            size = file_path.stat().st_size
+            file_path.unlink()
+        except OSError as exc:
+            raise FileToolError(f"无法删除文件：{path}") from exc
+
+        display_path = self.workspace.display(file_path)
+        return ToolResult.success(
+            f"已删除文件：{display_path}",
+            path=display_path,
+            bytes=size,
+            change_type="deleted",
+        )
+
+    def normalize_path(self, path: str, *, must_exist: bool = False) -> str:
+        return self.workspace.display(self._resolve(path, must_exist=must_exist))
 
     def _resolve(self, path: str | Path, *, must_exist: bool = False) -> Path:
         try:

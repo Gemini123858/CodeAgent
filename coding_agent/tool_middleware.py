@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Any
 
 from .chat_protocol import ChatProtocolError, parse_function_arguments
+from .turn_context import TurnContext
 from .tools import ToolRegistry, ToolResult
 
 
@@ -26,7 +27,13 @@ class ToolExecutionMiddleware:
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
 
-    def execute(self, step: int, call: Any) -> ToolExecution:
+    def execute(
+        self,
+        step: int,
+        call: Any,
+        *,
+        turn_context: TurnContext | None = None,
+    ) -> ToolExecution:
         started = perf_counter()
         tool_name = getattr(getattr(call, "function", None), "name", "<unknown>")
         raw_value = getattr(
@@ -44,13 +51,25 @@ class ToolExecutionMiddleware:
                 )
             else:
                 arguments = parse_function_arguments(raw_arguments)
-                result = self.registry.execute(tool_name, arguments)
+                result = self.registry.execute(
+                    tool_name,
+                    arguments,
+                    turn_context=turn_context,
+                )
         except ChatProtocolError as exc:
             result = ToolResult.failure(str(exc))
         except Exception as exc:
             result = ToolResult.failure(
                 f"工具中间层出现未预期错误：{type(exc).__name__}"
             )
+
+        approval_status = result.details.get("approval_status")
+        if result.ok:
+            execution_status = "success"
+        elif approval_status in {"denied", "reused_denied"}:
+            execution_status = "approval_denied"
+        else:
+            execution_status = "failed"
 
         return ToolExecution(
             step=step,
@@ -59,7 +78,7 @@ class ToolExecutionMiddleware:
             raw_arguments=raw_arguments,
             arguments=arguments,
             result=result,
-            status="success" if result.ok else "failed",
+            status=execution_status,
             duration_ms=(perf_counter() - started) * 1000,
         )
 

@@ -4,6 +4,7 @@ import argparse
 import sys
 
 from .agent import AgentError, AgentOutcome, AgentRunner
+from .approval import CLIApprovalProvider
 from .config import ConfigurationError, Settings, load_settings
 from .debug import DebugPrinter, debug_enabled
 from .llm_client import LLMClient, LLMRequestError
@@ -94,7 +95,10 @@ def main() -> int:
             workspace = Workspace.from_path(args.workspace)
             runner = SingleToolCallRunner(
                 llm,
-                ToolRegistry(workspace),
+                ToolRegistry(
+                    workspace,
+                    approval_provider=CLIApprovalProvider(),
+                ),
                 debug,
             )
             outcome = runner.run(prompt)
@@ -139,7 +143,10 @@ def _build_agent(
     workspace = Workspace.from_path(args.workspace)
     runner = AgentRunner(
         llm,
-        ToolRegistry(workspace),
+        ToolRegistry(
+            workspace,
+            approval_provider=CLIApprovalProvider(),
+        ),
         max_steps=args.max_steps or settings.max_steps,
         max_tool_calls=args.max_tool_calls or settings.max_tool_calls,
         debug=debug,
@@ -155,10 +162,11 @@ def _run_agent_once(
     debug: DebugPrinter,
     prompt: str,
 ) -> int:
+    # 构建工作区和 Agent 运行器，然后创建或恢复会话，执行一次对话轮次，并打印结果。
     workspace, runner = _build_agent(args, settings, llm, debug)
     with SessionStore.for_workspace(workspace.root) as store:
         session = ConversationSession(workspace.root, store, runner)
-        if args.conversation:
+        if args.conversation: # 如果提供了 --conversation 参数，则尝试恢复指定的会话，否则创建一个新的会话。
             conversation = session.resume(args.conversation)
         else:
             conversation = session.new(title_from_prompt(prompt))
@@ -174,13 +182,14 @@ def _run_interactive_session(
     llm: LLMClient,
     debug: DebugPrinter,
 ) -> int:
+    # 构建工作区和 Agent 运行器，然后创建或恢复会话，进入一个交互式循环，允许用户输入消息或会话命令，并在每轮对话后打印结果。
     workspace, runner = _build_agent(args, settings, llm, debug)
-    with SessionStore.for_workspace(workspace.root) as store:
+    with SessionStore.for_workspace(workspace.root) as store: # Create a session store for the workspace root directory, which will handle the storage of conversation sessions, turns, messages, and tool executions in a SQLite database.
         session = ConversationSession(workspace.root, store, runner)
         conversation = (
             session.resume(args.conversation)
             if args.conversation
-            else session.resume_latest_or_new()
+            else session.resume_latest_or_new() # 优先恢复最新的会话，如果没有则创建一个新的会话。
         )
         _print_session_banner(conversation.id, conversation.title)
 

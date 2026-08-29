@@ -16,11 +16,14 @@ from .llm_client import LLMClient
 from .request_builder import RequestBuilder
 from .tool_middleware import ToolExecution, ToolExecutionMiddleware
 from .tools import ToolRegistry
+from .turn_context import TurnContext
 
 
 SYSTEM_PROMPT = """你是一个本地编程智能体。请使用工具完成用户交给你的任务。
 读取文件后再修改，不要猜测项目内容。修改后尽可能运行相关命令验证结果。
 工具失败时请分析错误并尝试修正。确认任务完成后，不再调用工具，输出修改内容和验证结果。
+测试交互程序时通过 run_command 的 stdin 参数传入内容，不要使用 Shell 管道。
+临时文件应使用 delete_file 清理；用户拒绝某项操作后不要重复请求或尝试绕过。
 """
 
 ContextFactory = Callable[[], ConversationContext]
@@ -123,6 +126,7 @@ class AgentRunner:
 
         executions: list[ToolExecution] = []
         tool_call_count = 0
+        turn_context = TurnContext(turn_id=turn_id)
 
         for step in range(1, self.max_steps + 1):
             self._progress(f"[step {step}/{self.max_steps}] 请求模型...")
@@ -213,7 +217,14 @@ class AgentRunner:
                 executions.extend(batch)
                 raise ToolCallLimitExceeded(reason)
 
-            batch = [self.middleware.execute(step, call) for call in tool_calls]
+            batch = [
+                self.middleware.execute(
+                    step,
+                    call,
+                    turn_context=turn_context,
+                )
+                for call in tool_calls
+            ]
             self._record_tool_batch(
                 context,
                 serialized_assistant,
@@ -282,6 +293,7 @@ class AgentRunner:
         conversation_id: str | None,
         turn_id: int | None,
     ) -> None:
+        # 判断是否同时提供了 recorder、conversation_id 和 turn_id，如果只提供了部分参数，则抛出 ValueError 异常，确保持久化运行的完整性。
         supplied = (
             recorder is not None,
             conversation_id is not None,

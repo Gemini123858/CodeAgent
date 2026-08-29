@@ -1,6 +1,6 @@
 Python Coding Agent
 
-一个不依赖 Agent 框架的本地 Coding Agent，使用 DeepSeek 的 OpenAI 兼容接口。当前支持多步工具循环、多轮会话、SQLite 持久化、DEBUG 日志，以及 list_files、read_file、write_file、run_command 四个工作区工具。
+一个不依赖 Agent 框架、使用 DeepSeek OpenAI 兼容接口的本地 Coding Agent。支持多步工具循环、多轮会话、SQLite 持久化、DEBUG 日志，以及 list_files、read_file、write_file、delete_file、run_command。
 
 WSL Ubuntu 22.04：
 
@@ -9,18 +9,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 export DEEPSEEK_API_KEY='你的 Key'
 
-启动多轮会话：
+启动：
 
 python -m coding_agent --session --workspace ./demo --debug
 
-会话命令：/new [标题]、/resume <ID>、/list、/help、/exit。会话数据保存在工作区的 .coding-agent/state.db，该目录不会暴露给模型工具。
+会话命令：/new [标题]、/resume <ID>、/list、/help、/exit。数据保存在工作区 .coding-agent/state.db，该目录不会暴露给模型工具。
 
-执行一次持久化任务：
+执行单轮任务：
 
 python -m coding_agent --agent --workspace ./demo "创建 hello.py 并运行"
 
-可用 --max-steps 和 --max-tool-calls 设置单轮上限，也可设置 CODING_AGENT_MAX_STEPS、CODING_AGENT_MAX_TOOL_CALLS、CODING_AGENT_DEBUG。
+测试交互程序时，模型应通过 run_command 的 stdin 字段传入输入，不需要 Shell 管道。当前 Turn 通过 write_file 新建的普通文件可由 delete_file 自动删除；删除既有文件、移动或覆盖文件、执行检测到破坏行为的 Python 脚本时，CLI 会请求用户批准。拒绝结果会返回模型且相同请求不重复询问。越界、受保护路径、Shell 操作符和内联代码始终禁止。
 
-每次请求由 RequestBuilder 重新构造完整历史和工具；当前传入全部工具，已预留 EmbeddingProvider/EmbeddingToolSelector。工具失败会作为 error 工具消息保留，让模型下一步修正；调用超限时整批跳过并补齐对应结果；API 失败和步骤超限均记录 Turn 状态。回滚尚未实现，因此不会删除可能已产生副作用的失败轮次。
+SQLite 记录消息、工具结果、耗时、文件变化和审批决定，已为 diff、回滚及 LLM 命令审计预留接口。静态脚本检查不是操作系统沙箱，不能识别所有间接或混淆行为。
 
-工具只允许访问指定工作区并保护 .git、.env、.coding-agent；命令执行不启用 Shell、限制命令并移除敏感环境变量，但不等同于操作系统级沙箱。
+可用 --max-steps、--max-tool-calls，或 CODING_AGENT_MAX_STEPS、CODING_AGENT_MAX_TOOL_CALLS、CODING_AGENT_DEBUG 调整运行参数。

@@ -48,14 +48,14 @@ class SessionStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path).expanduser().resolve()
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True) # 如果数据库目录不存在，则创建它
         try:
             self.connection = sqlite3.connect(self.database_path)
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA foreign_keys = ON")
             self.connection.execute("PRAGMA journal_mode = WAL")
-            self._create_schema()
-            self._recover_interrupted_turns()
+            self._create_schema() # 创建数据库模式（建表等）
+            self._recover_interrupted_turns() # 恢复上次未完成的对话轮次，将其状态标记为“interrupted”
         except sqlite3.Error as exc:
             raise StorageError(f"无法初始化会话数据库：{exc}") from exc
 
@@ -82,7 +82,7 @@ class SessionStore:
         cleaned_title = (title or "新会话").strip() or "新会话"
         try:
             with self.connection:
-                self.connection.execute(
+                self.connection.execute( # 在数据库中插入一个新的会话记录，包含会话 ID、标题、工作目录路径、状态和时间戳。
                     """
                     INSERT INTO conversations(
                         id, title, workspace, status, created_at, updated_at
@@ -173,6 +173,9 @@ class SessionStore:
 
     def begin_turn(self, conversation_id: str, user_input: str) -> TurnRecord:
         now = utc_now()
+        # 先检查会话是否存在，如果不存在则抛出 StorageError 异常。
+        # 然后计算该会话的下一个轮次序号，并在 turns 表中插入一条新的记录，表示一个新的对话轮次开始。
+        # 最后，将用户输入作为消息记录到 messages 表中，并更新 conversations 表中的更新时间。
         try:
             with self.connection:
                 conversation = self.connection.execute(
@@ -219,6 +222,7 @@ class SessionStore:
         )
 
     def load_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+        # 从数据库中加载指定会话的所有消息，按顺序返回一个包含消息内容的列表。查询会排除状态为“interrupted”的轮次，以确保只获取完整的消息记录。如果消息的 JSON 数据损坏，将抛出 StorageError 异常。
         rows = self.connection.execute(
             """
             SELECT m.payload_json
@@ -238,6 +242,7 @@ class SessionStore:
         choice = response.choices[0]
         usage = getattr(response, "usage", None)
         now = utc_now()
+        # 向数据库中记录模型响应的相关信息，包括轮次 ID、步骤号、响应 ID、完成原因、使用的 token 数量等。如果在插入过程中发生 SQLite 错误，将抛出 StorageError 异常。
         try:
             with self.connection:
                 self.connection.execute(
@@ -324,6 +329,7 @@ class SessionStore:
                             now,
                         ),
                     )
+                    database_tool_call_id = int(cursor.lastrowid)
                     self.connection.execute(
                         """
                         INSERT INTO tool_results(
@@ -331,12 +337,24 @@ class SessionStore:
                         ) VALUES (?, ?, ?, ?, ?)
                         """,
                         (
-                            int(cursor.lastrowid),
+                            database_tool_call_id,
                             int(execution.result.ok),
                             execution.result.content,
                             self._json(execution.result.details),
                             now,
                         ),
+                    )
+                    self._record_file_change(
+                        conversation_id,
+                        turn_id,
+                        database_tool_call_id,
+                        execution,
+                        now,
+                    )
+                    self._record_approval(
+                        database_tool_call_id,
+                        execution,
+                        now,
                     )
                 self._append_messages(
                     conversation_id,
@@ -445,6 +463,69 @@ class SessionStore:
                 ),
             )
 
+    def _record_file_change(
+        self,
+        conversation_id: str,
+        turn_id: int,
+        database_tool_call_id: int,
+        execution: ToolExecution,
+        created_at: str,
+    ) -> None:
+        details = execution.result.details
+        change_type = details.get("change_type")
+        path = details.get("path")
+        if (
+            not execution.result.ok
+            or change_type not in {"created", "modified", "deleted"}
+            or not isinstance(path, str)
+        ):
+            return
+        self.connection.execute(
+            """
+            INSERT INTO file_changes(
+                conversation_id, turn_id, tool_call_id, path, change_type,
+                existed_before, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                turn_id,
+                database_tool_call_id,
+                path,
+                change_type,
+                int(bool(details.get("existed_before"))),
+                created_at,
+            ),
+        )
+
+    def _record_approval(
+        self,
+        database_tool_call_id: int,
+        execution: ToolExecution,
+        created_at: str,
+    ) -> None:
+        details = execution.result.details
+        status = details.get("approval_status")
+        if not isinstance(status, str):
+            return
+        self.connection.execute(
+            """
+            INSERT INTO approval_requests(
+                tool_call_id, status, risk_level, reason, summary,
+                audit_advice, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                database_tool_call_id,
+                status,
+                str(details.get("approval_risk", "unknown")),
+                str(details.get("approval_reason", "")),
+                str(details.get("approval_summary", "")),
+                details.get("audit_advice"),
+                created_at,
+            ),
+        )
+
     def _create_schema(self) -> None:
         self.connection.executescript(
             """
@@ -532,16 +613,43 @@ class SessionStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS file_changes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                turn_id INTEGER NOT NULL REFERENCES turns(id),
+                tool_call_id INTEGER NOT NULL REFERENCES tool_calls(id),
+                path TEXT NOT NULL,
+                change_type TEXT NOT NULL,
+                existed_before INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS approval_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_call_id INTEGER NOT NULL UNIQUE REFERENCES tool_calls(id),
+                status TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                audit_advice TEXT,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_turns_conversation
                 ON turns(conversation_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation
                 ON messages(conversation_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_tool_calls_turn
                 ON tool_calls(turn_id, step);
+            CREATE INDEX IF NOT EXISTS idx_file_changes_turn
+                ON file_changes(turn_id, id);
+
+            UPDATE schema_meta SET value = '2'
+            WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 2;
             """
         )
 
-    def _recover_interrupted_turns(self) -> None:
+    def _recover_interrupted_turns(self) -> None: # Recover any turns that were left in a "running" state when the process exited unexpectedly, marking them as "interrupted" to indicate they were not completed. This ensures that the system can handle unexpected shutdowns gracefully and maintain data integrity.
         now = utc_now()
         with self.connection:
             self.connection.execute(

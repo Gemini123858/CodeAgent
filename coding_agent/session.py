@@ -22,7 +22,7 @@ class ConversationSession:
         store: SessionStore,
         runner: AgentRunner,
     ) -> None:
-        self.workspace = workspace.resolve()
+        self.workspace = workspace.resolve() # 将工作目录路径解析为绝对路径，确保在会话中使用一致的路径表示。
         self.store = store
         self.runner = runner
         self.current: ConversationRecord | None = None
@@ -38,7 +38,7 @@ class ConversationSession:
         self.current = conversation
         return conversation
 
-    def resume_latest_or_new(self) -> ConversationRecord:
+    def resume_latest_or_new(self) -> ConversationRecord: # 看看是否有最新的会话，如果有就恢复它，否则创建一个新的会话。
         latest = self.store.latest_conversation()
         if latest is None:
             return self.new()
