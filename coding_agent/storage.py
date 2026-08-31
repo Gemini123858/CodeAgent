@@ -76,6 +76,13 @@ class DeleteConversationOutcome:
     blob_cleanup_failures: int
 
 
+@dataclass(frozen=True)
+class ContextSummaryRecord:
+    conversation_id: str
+    through_turn_sequence: int
+    content: str
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -256,6 +263,50 @@ class SessionStore:
             raise StorageError("数据库中的历史消息 JSON 已损坏。") from exc
         return history
 
+    def get_context_summary(
+        self,
+        conversation_id: str,
+    ) -> ContextSummaryRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM context_summaries WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ContextSummaryRecord(
+            conversation_id=row["conversation_id"],
+            through_turn_sequence=row["through_turn_sequence"],
+            content=row["content"],
+        )
+
+    def save_context_summary(
+        self,
+        conversation_id: str,
+        through_turn_sequence: int,
+        content: str,
+    ) -> None:
+        try:
+            with self.connection:
+                self.connection.execute(
+                    """
+                    INSERT INTO context_summaries(
+                        conversation_id, through_turn_sequence, content, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(conversation_id) DO UPDATE SET
+                        through_turn_sequence = excluded.through_turn_sequence,
+                        content = excluded.content,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        conversation_id,
+                        through_turn_sequence,
+                        content,
+                        utc_now(),
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"无法保存上下文摘要：{exc}") from exc
+
     def delete_conversation(
         self,
         conversation_id: str,
@@ -291,6 +342,10 @@ class SessionStore:
         }
         try:
             with self.connection:
+                self.connection.execute(
+                    "DELETE FROM context_summaries WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
                 self.connection.execute(
                     """
                     DELETE FROM approval_requests
@@ -429,18 +484,31 @@ class SessionStore:
             status="running",
         )
 
-    def load_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+    def load_messages(
+        self,
+        conversation_id: str,
+        *,
+        after_turn_sequence: int = 0,
+        through_turn_sequence: int | None = None,
+    ) -> list[dict[str, Any]]:
         # 从数据库中加载指定会话的所有消息，按顺序返回一个包含消息内容的列表。查询会排除状态为“interrupted”的轮次，以确保只获取完整的消息记录。如果消息的 JSON 数据损坏，将抛出 StorageError 异常。
+        parameters: list[Any] = [conversation_id, after_turn_sequence]
+        upper_bound = ""
+        if through_turn_sequence is not None:
+            upper_bound = "AND t.sequence <= ?"
+            parameters.append(through_turn_sequence)
         rows = self.connection.execute(
-            """
+            f"""
             SELECT m.payload_json
             FROM messages m
             JOIN turns t ON t.id = m.turn_id
             WHERE m.conversation_id = ?
               AND t.status NOT IN ('interrupted', 'rolled_back')
+              AND t.sequence > ?
+              {upper_bound}
             ORDER BY m.sequence
             """,
-            (conversation_id,),
+            parameters,
         ).fetchall()
         try:
             return [json.loads(row["payload_json"]) for row in rows]
@@ -808,6 +876,13 @@ class SessionStore:
                     "UPDATE conversations SET updated_at = ? WHERE id = ?",
                     (now, target.turn.conversation_id),
                 )
+                self.connection.execute(
+                    """
+                    DELETE FROM context_summaries
+                    WHERE conversation_id = ? AND through_turn_sequence >= ?
+                    """,
+                    (target.turn.conversation_id, target.turn.sequence),
+                )
         except StorageError:
             raise
         except sqlite3.Error as exc:
@@ -1085,6 +1160,13 @@ class SessionStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS context_summaries(
+                conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
+                through_turn_sequence INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_turns_conversation
                 ON turns(conversation_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation
@@ -1096,8 +1178,8 @@ class SessionStore:
             CREATE INDEX IF NOT EXISTS idx_snapshots_turn
                 ON snapshots(turn_id, kind);
 
-            UPDATE schema_meta SET value = '3'
-            WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 3;
+            UPDATE schema_meta SET value = '4'
+            WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 4;
             """
         )
 

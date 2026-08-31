@@ -8,6 +8,7 @@ from datetime import datetime
 
 from .agent import AgentError, AgentOutcome, AgentRunner
 from .approval import CLIApprovalProvider
+from .command_policy import LLMCommandAuditor
 from .config import ConfigurationError, Settings, load_settings
 from .debug import DebugPrinter, debug_enabled
 from .llm_client import LLMClient, LLMRequestError
@@ -102,6 +103,11 @@ def main() -> int:
                 ToolRegistry(
                     workspace,
                     approval_provider=CLIApprovalProvider(),
+                    command_auditor=(
+                        LLMCommandAuditor(llm)
+                        if settings.llm_command_audit
+                        else None
+                    ),
                 ),
                 debug,
             )
@@ -151,6 +157,9 @@ def _build_agent(
         ToolRegistry(
             workspace,
             approval_provider=CLIApprovalProvider(),
+            command_auditor=(
+                LLMCommandAuditor(llm) if settings.llm_command_audit else None
+            ),
         ),
         max_steps=args.max_steps or settings.max_steps,
         max_tool_calls=args.max_tool_calls or settings.max_tool_calls,
@@ -170,7 +179,12 @@ def _run_agent_once(
     # 构建工作区和 Agent 运行器，然后创建或恢复会话，执行一次对话轮次，并打印结果。
     workspace, runner = _build_agent(args, settings, llm, debug)
     with SessionStore.for_workspace(workspace.root) as store:
-        session = ConversationSession(workspace.root, store, runner)
+        session = ConversationSession(
+            workspace.root,
+            store,
+            runner,
+            context_token_limit=settings.context_token_limit,
+        )
         if args.conversation: # 如果提供了 --conversation 参数，则尝试恢复指定的会话，否则创建一个新的会话。
             conversation = session.resume(args.conversation)
         else:
@@ -190,7 +204,12 @@ def _run_interactive_session(
     # 构建工作区和 Agent 运行器，然后创建或恢复会话，进入一个交互式循环，允许用户输入消息或会话命令，并在每轮对话后打印结果。
     workspace, runner = _build_agent(args, settings, llm, debug)
     with SessionStore.for_workspace(workspace.root) as store: # Create a session store for the workspace root directory, which will handle the storage of conversation sessions, turns, messages, and tool executions in a SQLite database.
-        session = ConversationSession(workspace.root, store, runner)
+        session = ConversationSession(
+            workspace.root,
+            store,
+            runner,
+            context_token_limit=settings.context_token_limit,
+        )
         conversation = (
             session.resume(args.conversation)
             if args.conversation
@@ -352,7 +371,11 @@ def _print_outcome(outcome: AgentOutcome) -> None:
     print(
         f"\n执行统计：{outcome.steps} 次模型请求，"
         f"{len(outcome.tool_executions)} 次工具调用，"
-        f"保留 {outcome.retained_messages} 条消息。"
+        f"保留 {outcome.retained_messages} 条消息；"
+        f"Token {outcome.token_usage.total_tokens} "
+        f"（输入 {outcome.token_usage.prompt_tokens} / "
+        f"输出 {outcome.token_usage.completion_tokens}，"
+        f"{'API usage' if outcome.token_usage.source == 'api' else '本地估算'}）。"
     )
 
 

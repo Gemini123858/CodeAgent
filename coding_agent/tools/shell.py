@@ -96,7 +96,14 @@ class CommandTool:
                 in {"deny", "review", "require_approval"}
             )
         )
-        approval_details: dict[str, object] = {}
+        approval_details: dict[str, object] = (
+            {
+                "audit_recommendation": audit_advice.recommendation,
+                "audit_advice": audit_advice.reason,
+            }
+            if audit_advice is not None
+            else {}
+        )
         if needs_approval:
             fingerprint = self._fingerprint(argv, normalized_stdin)
             # 检查是否已经有缓存的审批决策
@@ -119,13 +126,15 @@ class CommandTool:
                 approval_status = (
                     "reused_approved" if approved else "reused_denied"
                 )
-            approval_details = {
-                "approval_status": approval_status,
-                "approval_risk": assessment.risk_level,
-                "approval_reason": assessment.reason,
-                "approval_summary": f"运行命令：{shlex.join(argv)}",
-                "audit_advice": audit_advice.reason if audit_advice else None,
-            }
+            approval_details.update(
+                {
+                    "approval_status": approval_status,
+                    "approval_risk": assessment.risk_level,
+                    "approval_reason": assessment.reason,
+                    "approval_summary": f"运行命令：{shlex.join(argv)}",
+                    "audit_advice": audit_advice.reason if audit_advice else None,
+                }
+            )
             if not approved:
                 return ToolResult.failure(
                     "用户未批准该命令。请不要重复请求相同命令，改用更安全的方案。",

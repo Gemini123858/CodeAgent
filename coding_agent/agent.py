@@ -16,6 +16,7 @@ from .llm_client import LLMClient
 from .request_builder import RequestBuilder
 from .tool_middleware import ToolExecution, ToolExecutionMiddleware
 from .tools import ToolRegistry
+from .token_usage import TokenUsage, usage_from_response
 from .turn_context import TurnContext
 
 
@@ -78,6 +79,7 @@ class AgentOutcome:
     tool_executions: tuple[ToolExecution, ...]
     context_strategy: str
     retained_messages: int
+    token_usage: TokenUsage
 
 
 class AgentRunner:
@@ -126,6 +128,7 @@ class AgentRunner:
 
         executions: list[ToolExecution] = []
         tool_call_count = 0
+        token_usage = TokenUsage()
         turn_context = TurnContext(turn_id=turn_id)
 
         for step in range(1, self.max_steps + 1):
@@ -158,6 +161,13 @@ class AgentRunner:
                 raise
 
             self.debug.log(f"agent.response.{step}", response)
+            token_usage = token_usage.add(
+                usage_from_response(
+                    response,
+                    messages=request.messages,
+                    tools=request.tools,
+                )
+            )
             if recorder is not None and turn_id is not None:
                 recorder.record_model_response(turn_id, step, response)
 
@@ -194,6 +204,7 @@ class AgentRunner:
                     tool_executions=tuple(executions),
                     context_strategy=context.strategy_name,
                     retained_messages=context.message_count,
+                    token_usage=token_usage,
                 )
 
             if tool_call_count + len(tool_calls) > self.max_tool_calls:

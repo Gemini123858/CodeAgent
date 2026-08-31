@@ -1,6 +1,6 @@
 Python Coding Agent
 
-一个不依赖 Agent 框架、使用 DeepSeek OpenAI 兼容接口的本地 Coding Agent。支持多步工具循环、多轮会话、SQLite 持久化、工作区 diff、连续单步回滚、命令审批和 DEBUG 日志。
+使用 DeepSeek OpenAI 兼容接口的本地 Coding Agent，支持多步工具、多轮会话、SQLite、diff、连续回滚、审批和 DEBUG 日志。
 
 WSL Ubuntu 22.04：
 
@@ -22,10 +22,10 @@ python -m coding_agent --session --workspace ./demo --debug
 /help
 /exit
 
-每个 Turn 前后都会生成内容寻址快照，文件内容保存在 .coding-agent/snapshots 的去重 blob 仓库。/diff 彩色展示最近未回滚 Turn 的差异，也可查看指定 Turn；/rollback 恢复最近 Turn，可连续执行。/history 查看当前会话的交流和工具摘要；/delete 经确认后删除当前会话的数据库记录及独占快照。若工作区在 Turn 后又被外部修改，回滚会拒绝覆盖。
+每个 Turn 前后生成去重快照。/diff 彩色显示差异；/rollback 可连续恢复；/history 显示完整交流；/delete 经确认后删除会话。若工作区后来被外部修改，回滚会拒绝覆盖。
 
 测试交互程序时使用 run_command 的 stdin，不开放 Shell 管道。当前 Turn 通过 write_file 新建的文件可自动删除；删除既有文件、移动或覆盖文件、执行检测到破坏行为的 Python 脚本需要用户批准。越界、受保护路径和内联代码始终禁止。
 
-SQLite 同时保存消息、工具结果、文件变化、审批、快照和回滚链。静态脚本检查及文件级快照不是操作系统沙箱。
+Token 优先采用 API usage，否则本地估算。上下文达到限制的 80% 时，LLM 增量摘要较老 Turn；原始历史和快照不删除，回滚摘要覆盖的 Turn 会使摘要失效。
 
-可用 --max-steps、--max-tool-calls，或 CODING_AGENT_MAX_STEPS、CODING_AGENT_MAX_TOOL_CALLS、CODING_AGENT_DEBUG 调整运行参数。
+CODING_AGENT_CONTEXT_TOKEN_LIMIT 调整限制（默认 64000）；CODING_AGENT_LLM_AUDIT=1 启用可选命令审计。本地硬策略始终优先。另支持 --max-steps、--max-tool-calls 和 CODING_AGENT_DEBUG。

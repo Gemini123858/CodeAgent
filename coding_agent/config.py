@@ -8,6 +8,7 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_STEPS = 12
 DEFAULT_MAX_TOOL_CALLS = 32
+DEFAULT_CONTEXT_TOKEN_LIMIT = 64_000
 
 
 class ConfigurationError(RuntimeError):
@@ -21,6 +22,8 @@ class Settings:
     model: str
     max_steps: int = DEFAULT_MAX_STEPS
     max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS
+    context_token_limit: int = DEFAULT_CONTEXT_TOKEN_LIMIT
+    llm_command_audit: bool = False
 
 
 def load_settings() -> Settings:
@@ -38,6 +41,11 @@ def load_settings() -> Settings:
         "CODING_AGENT_MAX_TOOL_CALLS",
         str(DEFAULT_MAX_TOOL_CALLS),
     )
+    raw_context_limit = os.getenv(
+        "CODING_AGENT_CONTEXT_TOKEN_LIMIT",
+        str(DEFAULT_CONTEXT_TOKEN_LIMIT),
+    )
+    raw_llm_audit = os.getenv("CODING_AGENT_LLM_AUDIT", "0").strip().lower()
     if not base_url:
         raise ConfigurationError("DEEPSEEK_BASE_URL 不能为空。")
     if not model:
@@ -54,6 +62,20 @@ def load_settings() -> Settings:
         raise ConfigurationError("CODING_AGENT_MAX_TOOL_CALLS 必须是整数。") from exc
     if max_tool_calls <= 0:
         raise ConfigurationError("CODING_AGENT_MAX_TOOL_CALLS 必须大于 0。")
+    try:
+        context_token_limit = int(raw_context_limit)
+    except ValueError as exc:
+        raise ConfigurationError(
+            "CODING_AGENT_CONTEXT_TOKEN_LIMIT 必须是整数。"
+        ) from exc
+    if context_token_limit <= 0:
+        raise ConfigurationError(
+            "CODING_AGENT_CONTEXT_TOKEN_LIMIT 必须大于 0。"
+        )
+    if raw_llm_audit not in {"0", "1", "false", "true", "no", "yes"}:
+        raise ConfigurationError(
+            "CODING_AGENT_LLM_AUDIT 必须是 0/1、false/true 或 no/yes。"
+        )
 
     return Settings(
         api_key=api_key,
@@ -61,4 +83,6 @@ def load_settings() -> Settings:
         model=model,
         max_steps=max_steps,
         max_tool_calls=max_tool_calls,
+        context_token_limit=context_token_limit,
+        llm_command_audit=raw_llm_audit in {"1", "true", "yes"},
     )
