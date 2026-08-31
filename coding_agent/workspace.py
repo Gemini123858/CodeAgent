@@ -60,7 +60,7 @@ class Workspace:
     @staticmethod
     def _is_protected_name(name: str) -> bool:
         return (
-            name in {".git", ".coding-agent", "agent_env"}
+            name in {".git", ".coding-agent", ".venv", "agent_env"}
             or name.startswith(".env")
         )
 

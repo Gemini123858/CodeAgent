@@ -39,6 +39,43 @@ class TurnRecord:
     status: str
 
 
+@dataclass(frozen=True)
+class SnapshotEntryRecord:
+    path: str
+    kind: str
+    blob_hash: str | None
+    size: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class RollbackTarget:
+    turn: TurnRecord
+    before_snapshot_id: int
+    after_snapshot_id: int
+
+
+@dataclass(frozen=True)
+class ConversationHistoryTurn:
+    sequence: int
+    status: str
+    started_at: str
+    finished_at: str | None
+    messages: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class DeleteConversationOutcome:
+    conversation_id: str
+    title: str
+    turns_deleted: int
+    messages_deleted: int
+    tool_calls_deleted: int
+    snapshots_deleted: int
+    blobs_deleted: int
+    blob_cleanup_failures: int
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -171,11 +208,182 @@ class SessionStore:
         ).fetchall()
         return [self._conversation_from_row(row) for row in rows]
 
+    def load_conversation_history(
+        self,
+        conversation_id: str,
+        limit: int = 20,
+    ) -> list[ConversationHistoryTurn]:
+        if limit <= 0 or limit > 100:
+            raise StorageError("历史记录数量必须在 1 到 100 之间。")
+        self.get_conversation(conversation_id)
+        turn_rows = self.connection.execute(
+            """
+            SELECT * FROM (
+                SELECT id, sequence, status, started_at, finished_at
+                FROM turns
+                WHERE conversation_id = ?
+                ORDER BY sequence DESC
+                LIMIT ?
+            ) recent
+            ORDER BY sequence
+            """,
+            (conversation_id, limit),
+        ).fetchall()
+        history: list[ConversationHistoryTurn] = []
+        try:
+            for turn in turn_rows:
+                message_rows = self.connection.execute(
+                    """
+                    SELECT payload_json FROM messages
+                    WHERE turn_id = ?
+                    ORDER BY sequence
+                    """,
+                    (turn["id"],),
+                ).fetchall()
+                history.append(
+                    ConversationHistoryTurn(
+                        sequence=turn["sequence"],
+                        status=turn["status"],
+                        started_at=turn["started_at"],
+                        finished_at=turn["finished_at"],
+                        messages=tuple(
+                            json.loads(row["payload_json"])
+                            for row in message_rows
+                        ),
+                    )
+                )
+        except json.JSONDecodeError as exc:
+            raise StorageError("数据库中的历史消息 JSON 已损坏。") from exc
+        return history
+
+    def delete_conversation(
+        self,
+        conversation_id: str,
+    ) -> DeleteConversationOutcome:
+        conversation = self.get_conversation(conversation_id)
+        blob_rows = self.connection.execute(
+            """
+            SELECT DISTINCT se.blob_hash
+            FROM snapshot_entries se
+            JOIN snapshots s ON s.id = se.snapshot_id
+            WHERE s.conversation_id = ? AND se.blob_hash IS NOT NULL
+            """,
+            (conversation_id,),
+        ).fetchall()
+        candidate_blobs = {row["blob_hash"] for row in blob_rows}
+        counts = {
+            "turns": self.connection.execute(
+                "SELECT COUNT(*) FROM turns WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0],
+            "messages": self.connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0],
+            "tool_calls": self.connection.execute(
+                "SELECT COUNT(*) FROM tool_calls WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0],
+            "snapshots": self.connection.execute(
+                "SELECT COUNT(*) FROM snapshots WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()[0],
+        }
+        try:
+            with self.connection:
+                self.connection.execute(
+                    """
+                    DELETE FROM approval_requests
+                    WHERE tool_call_id IN (
+                        SELECT id FROM tool_calls WHERE conversation_id = ?
+                    )
+                    """,
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM tool_results
+                    WHERE tool_call_id IN (
+                        SELECT id FROM tool_calls WHERE conversation_id = ?
+                    )
+                    """,
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM file_changes WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM rollbacks WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM turn_snapshots
+                    WHERE turn_id IN (
+                        SELECT id FROM turns WHERE conversation_id = ?
+                    )
+                    """,
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM snapshot_entries
+                    WHERE snapshot_id IN (
+                        SELECT id FROM snapshots WHERE conversation_id = ?
+                    )
+                    """,
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM snapshots WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM tool_calls WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    """
+                    DELETE FROM model_requests
+                    WHERE turn_id IN (
+                        SELECT id FROM turns WHERE conversation_id = ?
+                    )
+                    """,
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM turns WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+                self.connection.execute(
+                    "DELETE FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"无法删除会话：{exc}") from exc
+
+        blobs_deleted, cleanup_failures = self._cleanup_unreferenced_blobs(
+            candidate_blobs
+        )
+        return DeleteConversationOutcome(
+            conversation_id=conversation.id,
+            title=conversation.title,
+            turns_deleted=counts["turns"],
+            messages_deleted=counts["messages"],
+            tool_calls_deleted=counts["tool_calls"],
+            snapshots_deleted=counts["snapshots"],
+            blobs_deleted=blobs_deleted,
+            blob_cleanup_failures=cleanup_failures,
+        )
+
     def begin_turn(self, conversation_id: str, user_input: str) -> TurnRecord:
         now = utc_now()
-        # 先检查会话是否存在，如果不存在则抛出 StorageError 异常。
-        # 然后计算该会话的下一个轮次序号，并在 turns 表中插入一条新的记录，表示一个新的对话轮次开始。
-        # 最后，将用户输入作为消息记录到 messages 表中，并更新 conversations 表中的更新时间。
+        # 在数据库中创建一个新的对话轮次记录，包含会话 ID、轮次序号、用户输入、状态和时间戳。如果会话不存在，将抛出 StorageError 异常。如果在插入过程中发生 SQLite 错误，也将抛出 StorageError 异常。
         try:
             with self.connection:
                 conversation = self.connection.execute(
@@ -228,7 +436,8 @@ class SessionStore:
             SELECT m.payload_json
             FROM messages m
             JOIN turns t ON t.id = m.turn_id
-            WHERE m.conversation_id = ? AND t.status != 'interrupted'
+            WHERE m.conversation_id = ?
+              AND t.status NOT IN ('interrupted', 'rolled_back')
             ORDER BY m.sequence
             """,
             (conversation_id,),
@@ -427,6 +636,183 @@ class SessionStore:
             status=row["status"],
         )
 
+    def create_snapshot(
+        self,
+        conversation_id: str,
+        turn_id: int,
+        kind: str,
+        entries: list[SnapshotEntryRecord],
+    ) -> int:
+        # 在数据库中创建一个新的工作区快照记录，包含会话 ID、轮次 ID、快照类型（before 或 after）、快照条目数量、总字节数和时间戳。如果快照类型不支持，将抛出 StorageError 异常。如果在插入过程中发生 SQLite 错误，也将抛出 StorageError 异常。返回新创建的快照 ID。
+        if kind not in {"before", "after"}:
+            raise StorageError(f"不支持的快照类型：{kind}")
+        now = utc_now()
+        try:
+            with self.connection:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO snapshots(
+                        conversation_id, turn_id, kind, entry_count,
+                        total_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_id,
+                        turn_id,
+                        kind,
+                        len(entries),
+                        sum(entry.size for entry in entries if entry.kind == "file"),
+                        now,
+                    ),
+                )
+                snapshot_id = int(cursor.lastrowid)
+                self.connection.executemany(
+                    """
+                    INSERT INTO snapshot_entries(
+                        snapshot_id, path, kind, blob_hash, size, mode
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            snapshot_id,
+                            entry.path,
+                            entry.kind,
+                            entry.blob_hash,
+                            entry.size,
+                            entry.mode,
+                        )
+                        for entry in entries
+                    ],
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO turn_snapshots(turn_id, before_snapshot_id, after_snapshot_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(turn_id) DO UPDATE SET
+                        before_snapshot_id = COALESCE(
+                            excluded.before_snapshot_id,
+                            turn_snapshots.before_snapshot_id
+                        ),
+                        after_snapshot_id = COALESCE(
+                            excluded.after_snapshot_id,
+                            turn_snapshots.after_snapshot_id
+                        )
+                    """,
+                    (
+                        turn_id,
+                        snapshot_id if kind == "before" else None,
+                        snapshot_id if kind == "after" else None,
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"无法保存工作区快照：{exc}") from exc
+        return snapshot_id
+
+    def get_snapshot_entries(
+        self,
+        snapshot_id: int,
+    ) -> list[SnapshotEntryRecord]:
+        rows = self.connection.execute(
+            """
+            SELECT path, kind, blob_hash, size, mode
+            FROM snapshot_entries
+            WHERE snapshot_id = ?
+            ORDER BY path
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        return [
+            SnapshotEntryRecord(
+                path=row["path"],
+                kind=row["kind"],
+                blob_hash=row["blob_hash"],
+                size=row["size"],
+                mode=row["mode"],
+            )
+            for row in rows
+        ]
+
+    def turn_for_diff(
+        self,
+        conversation_id: str,
+        sequence: int | None = None,
+    ) -> RollbackTarget:
+        parameters: list[Any] = [conversation_id]
+        sequence_filter = ""
+        if sequence is not None:
+            sequence_filter = "AND t.sequence = ?"
+            parameters.append(sequence)
+        else:
+            sequence_filter = "AND t.status != 'rolled_back'"
+        row = self.connection.execute(
+            f"""
+            SELECT t.*, ts.before_snapshot_id, ts.after_snapshot_id
+            FROM turns t
+            JOIN turn_snapshots ts ON ts.turn_id = t.id
+            WHERE t.conversation_id = ?
+              AND ts.before_snapshot_id IS NOT NULL
+              AND ts.after_snapshot_id IS NOT NULL
+              {sequence_filter}
+            ORDER BY t.sequence DESC
+            LIMIT 1
+            """,
+            parameters,
+        ).fetchone()
+        if row is None:
+            label = f"第 {sequence} 轮" if sequence is not None else "当前会话"
+            raise StorageError(f"{label}没有可用的前后快照。")
+        return RollbackTarget(
+            turn=TurnRecord(
+                id=row["id"],
+                conversation_id=row["conversation_id"],
+                sequence=row["sequence"],
+                user_input=row["user_input"],
+                status=row["status"],
+            ),
+            before_snapshot_id=row["before_snapshot_id"],
+            after_snapshot_id=row["after_snapshot_id"],
+        )
+
+    def latest_rollback_target(self, conversation_id: str) -> RollbackTarget:
+        return self.turn_for_diff(conversation_id)
+
+    def record_rollback(self, target: RollbackTarget) -> None:
+        now = utc_now()
+        try:
+            with self.connection:
+                cursor = self.connection.execute(
+                    """
+                    UPDATE turns SET status = 'rolled_back'
+                    WHERE id = ? AND status != 'rolled_back'
+                    """,
+                    (target.turn.id,),
+                )
+                if cursor.rowcount != 1:
+                    raise StorageError("该轮次已经回滚，不能重复回滚。")
+                self.connection.execute(
+                    """
+                    INSERT INTO rollbacks(
+                        conversation_id, target_turn_id, original_status,
+                        restored_snapshot_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target.turn.conversation_id,
+                        target.turn.id,
+                        target.turn.status,
+                        target.before_snapshot_id,
+                        now,
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                    (now, target.turn.conversation_id),
+                )
+        except StorageError:
+            raise
+        except sqlite3.Error as exc:
+            raise StorageError(f"无法记录回滚操作：{exc}") from exc
+
     def _append_messages(
         self,
         conversation_id: str,
@@ -462,6 +848,34 @@ class SessionStore:
                     now,
                 ),
             )
+
+    def _cleanup_unreferenced_blobs(
+        self,
+        candidates: set[str],
+    ) -> tuple[int, int]:
+        blob_root = self.database_path.parent / "snapshots" / "blobs"
+        deleted = 0
+        failures = 0
+        for blob_hash in candidates:
+            referenced = self.connection.execute(
+                "SELECT 1 FROM snapshot_entries WHERE blob_hash = ? LIMIT 1",
+                (blob_hash,),
+            ).fetchone()
+            if referenced is not None:
+                continue
+            blob_path = blob_root / blob_hash[:2] / blob_hash[2:]
+            try:
+                if not blob_path.exists():
+                    continue
+                blob_path.unlink()
+                deleted += 1
+                try:
+                    blob_path.parent.rmdir()
+                except OSError:
+                    pass
+            except OSError:
+                failures += 1
+        return deleted, failures
 
     def _record_file_change(
         self,
@@ -635,6 +1049,42 @@ class SessionStore:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS snapshots(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                turn_id INTEGER NOT NULL REFERENCES turns(id),
+                kind TEXT NOT NULL,
+                entry_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(turn_id, kind)
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshot_entries(
+                snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+                path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                blob_hash TEXT,
+                size INTEGER NOT NULL,
+                mode INTEGER NOT NULL,
+                PRIMARY KEY(snapshot_id, path)
+            );
+
+            CREATE TABLE IF NOT EXISTS turn_snapshots(
+                turn_id INTEGER PRIMARY KEY REFERENCES turns(id),
+                before_snapshot_id INTEGER REFERENCES snapshots(id),
+                after_snapshot_id INTEGER REFERENCES snapshots(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS rollbacks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id),
+                target_turn_id INTEGER NOT NULL UNIQUE REFERENCES turns(id),
+                original_status TEXT NOT NULL,
+                restored_snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_turns_conversation
                 ON turns(conversation_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_messages_conversation
@@ -643,9 +1093,11 @@ class SessionStore:
                 ON tool_calls(turn_id, step);
             CREATE INDEX IF NOT EXISTS idx_file_changes_turn
                 ON file_changes(turn_id, id);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_turn
+                ON snapshots(turn_id, kind);
 
-            UPDATE schema_meta SET value = '2'
-            WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 2;
+            UPDATE schema_meta SET value = '3'
+            WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 3;
             """
         )
 

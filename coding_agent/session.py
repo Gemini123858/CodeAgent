@@ -10,7 +10,14 @@ from .agent import (
     ModelOutputTruncated,
     ToolCallLimitExceeded,
 )
-from .storage import ConversationRecord, SessionStore
+from .snapshot import RollbackOutcome, WorkspaceSnapshotManager
+from .storage import (
+    ConversationHistoryTurn,
+    ConversationRecord,
+    DeleteConversationOutcome,
+    SessionStore,
+)
+from .workspace import Workspace
 
 
 class ConversationSession:
@@ -25,6 +32,10 @@ class ConversationSession:
         self.workspace = workspace.resolve() # 将工作目录路径解析为绝对路径，确保在会话中使用一致的路径表示。
         self.store = store
         self.runner = runner
+        self.snapshots = WorkspaceSnapshotManager(
+            Workspace.from_path(self.workspace),
+            store,
+        )
         self.current: ConversationRecord | None = None
 
     def new(self, title: str | None = None) -> ConversationRecord:
@@ -59,6 +70,11 @@ class ConversationSession:
             )
 
         turn = self.store.begin_turn(self.current.id, cleaned_input)
+        try:
+            self.snapshots.capture(self.current.id, turn.id, "before")
+        except Exception as exc:
+            self.store.finish_turn(turn.id, "snapshot_failed", error=exc)
+            raise
         history = self.store.load_messages(self.current.id)
         try:
             outcome = self.runner.run(
@@ -69,25 +85,70 @@ class ConversationSession:
                 turn_id=turn.id,
             )
         except ToolCallLimitExceeded as exc:
-            self.store.finish_turn(turn.id, "tool_limit_exceeded", error=exc)
+            self._finish_turn(turn.id, "tool_limit_exceeded", exc)
             raise
         except MaxStepsExceeded as exc:
-            self.store.finish_turn(turn.id, "max_steps_exceeded", error=exc)
+            self._finish_turn(turn.id, "max_steps_exceeded", exc)
             raise
         except ModelOutputTruncated as exc:
-            self.store.finish_turn(turn.id, "output_truncated", error=exc)
+            self._finish_turn(turn.id, "output_truncated", exc)
             raise
         except KeyboardInterrupt:
             interrupted = AgentError("用户中断了当前对话轮次。")
-            self.store.finish_turn(turn.id, "interrupted", error=interrupted)
+            self._finish_turn(turn.id, "interrupted", interrupted)
             raise
         except Exception as exc:
-            self.store.finish_turn(turn.id, "failed", error=exc)
+            self._finish_turn(turn.id, "failed", exc)
             raise
         else:
-            self.store.finish_turn(turn.id, "completed")
+            self._finish_turn(turn.id, "completed")
             self.current = self.store.get_conversation(self.current.id)
             return outcome
+
+    def render_diff(self, sequence: int | None = None) -> str:
+        if self.current is None:
+            raise AgentError("当前没有活动会话。")
+        return self.snapshots.render_diff(self.current.id, sequence)
+
+    def rollback(self) -> RollbackOutcome:
+        if self.current is None:
+            raise AgentError("当前没有活动会话。")
+        outcome = self.snapshots.rollback_latest(self.current.id)
+        self.current = self.store.get_conversation(self.current.id)
+        return outcome
+
+    def history(self, limit: int = 20) -> list[ConversationHistoryTurn]:
+        if self.current is None:
+            raise AgentError("当前没有活动会话。")
+        return self.store.load_conversation_history(self.current.id, limit)
+
+    def delete_current(
+        self,
+    ) -> tuple[DeleteConversationOutcome, ConversationRecord]:
+        if self.current is None:
+            raise AgentError("当前没有活动会话。")
+        outcome = self.store.delete_conversation(self.current.id)
+        latest = self.store.latest_conversation()
+        self.current = (
+            latest
+            if latest is not None
+            else self.store.create_conversation(self.workspace, "新会话")
+        )
+        return outcome, self.current
+
+    def _finish_turn(
+        self,
+        turn_id: int,
+        status: str,
+        error: Exception | None = None,
+    ) -> None:
+        assert self.current is not None
+        try:
+            self.snapshots.capture(self.current.id, turn_id, "after")
+        except Exception as exc:
+            self.store.finish_turn(turn_id, "snapshot_failed", error=exc)
+            raise
+        self.store.finish_turn(turn_id, status, error=error)
 
 
 def title_from_prompt(prompt: str, limit: int = 40) -> str:
