@@ -205,8 +205,8 @@ class CommandTool:
                 "不允许使用 Shell 管道、重定向或连接符；"
                 "需要向程序输入内容时请使用 run_command 的 stdin 参数。"
             )
-        if executable not in self.allowed_commands:
-            raise CommandToolError(f"命令不在允许列表中：{executable}")
+        # if executable not in self.allowed_commands:
+        #     raise CommandToolError(f"命令不在允许列表中：{executable}")
 
         if executable in {"python", "python3"} and "-c" in argv[1:]:
             raise CommandToolError("不允许通过 python -c 执行内联代码。")

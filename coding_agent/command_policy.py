@@ -141,7 +141,7 @@ class CommandPolicy:
         if executable in {"python", "python3"}:
             return self._assess_python(argv, workspace)
         return CommandAssessment(
-            PolicyAction.DENY,
+            PolicyAction.REQUIRE_APPROVAL,
             "high",
             f"命令没有对应的风险策略：{executable}",
         )

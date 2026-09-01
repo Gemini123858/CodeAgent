@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
-DEFAULT_MAX_STEPS = 12
+DEFAULT_MAX_STEPS = 20
 DEFAULT_MAX_TOOL_CALLS = 32
-DEFAULT_CONTEXT_TOKEN_LIMIT = 64_000
+DEFAULT_CONTEXT_TOKEN_LIMIT = 960_000  # 1M
 
 
 class ConfigurationError(RuntimeError):
