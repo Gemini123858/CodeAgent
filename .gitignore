@@ -16,3 +16,4 @@ agent_env
 !README.txt
 *.env*
 demo/
+interview*

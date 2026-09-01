@@ -12,7 +12,11 @@ from .command_policy import LLMCommandAuditor
 from .config import ConfigurationError, Settings, load_settings
 from .debug import DebugPrinter, debug_enabled
 from .llm_client import LLMClient, LLMRequestError
-from .session import ConversationSession, title_from_prompt
+from .session import (
+    ContextCompressionOutcome,
+    ConversationSession,
+    title_from_prompt,
+)
 from .snapshot import SnapshotError
 from .storage import ConversationHistoryTurn, SessionStore, StorageError
 from .tool_call import SingleToolCallRunner, ToolCallError
@@ -301,6 +305,11 @@ def _handle_session_command(
                     print("历史记录数量必须在 1 到 100 之间。", file=sys.stderr)
                     return False
             _print_history(session.history(limit))
+        elif command == "/context":
+            if argument:
+                print("用法：/context", file=sys.stderr)
+                return False
+            _print_context_outcome(session.compact_context())
         elif command in {"/delete", "/delete-session"}:
             if argument:
                 print("用法：/delete", file=sys.stderr)
@@ -339,7 +348,7 @@ def _handle_session_command(
         elif command == "/help":
             print(
                 "/new [标题]  /resume <ID>  /list  /diff [Turn]  "
-                "/rollback  /history [数量]  /delete  /help  /exit"
+                "/rollback  /history [数量]  /context  /delete  /help  /exit"
             )
         else:
             print(f"未知命令：{command}；输入 /help 查看帮助。", file=sys.stderr)
@@ -377,6 +386,29 @@ def _print_outcome(outcome: AgentOutcome) -> None:
         f"输出 {outcome.token_usage.completion_tokens}，"
         f"{'API usage' if outcome.token_usage.source == 'api' else '本地估算'}）。"
     )
+
+
+def _print_context_outcome(outcome: ContextCompressionOutcome) -> None:
+    before_percent = outcome.before_tokens / outcome.limit_tokens * 100
+    trigger_percent = outcome.trigger_tokens / outcome.limit_tokens * 100
+    print(
+        f"上下文窗口：约 {outcome.before_tokens} / {outcome.limit_tokens} tokens "
+        f"（{before_percent:.1f}%）"
+    )
+    print(
+        f"压缩阈值：{outcome.trigger_tokens} tokens "
+        f"（{trigger_percent:.0f}%）"
+    )
+    if outcome.summary_through_sequence is not None:
+        print(f"当前摘要已覆盖至 Turn {outcome.summary_through_sequence}。")
+    if outcome.compressed:
+        after_percent = outcome.after_tokens / outcome.limit_tokens * 100
+        print(
+            f"{outcome.reason} 压缩后约 {outcome.after_tokens} tokens "
+            f"（{after_percent:.1f}%）。"
+        )
+    else:
+        print(f"本次未压缩：{outcome.reason}")
 
 
 def _print_session_banner(conversation_id: str, title: str) -> None:

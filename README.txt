@@ -18,6 +18,7 @@ python -m coding_agent --session --workspace ./demo --debug
 /diff [Turn 序号]
 /rollback
 /history [数量]
+/context
 /delete
 /help
 /exit
@@ -26,6 +27,6 @@ python -m coding_agent --session --workspace ./demo --debug
 
 测试交互程序时使用 run_command 的 stdin，不开放 Shell 管道。当前 Turn 通过 write_file 新建的文件可自动删除；删除既有文件、移动或覆盖文件、执行检测到破坏行为的 Python 脚本需要用户批准。越界、受保护路径和内联代码始终禁止。
 
-Token 优先采用 API usage，否则本地估算。上下文达到限制的 80% 时，LLM 增量摘要较老 Turn；原始历史和快照不删除，回滚摘要覆盖的 Turn 会使摘要失效。
+Token 优先采用 API usage，否则本地估算。上下文达到限制的 80% 时，LLM 增量摘要较老 Turn；/context 显示窗口占用并按相同规则主动压缩。原始历史和快照不删除，回滚摘要覆盖的 Turn 会使摘要失效。
 
 CODING_AGENT_CONTEXT_TOKEN_LIMIT 调整限制（默认 64000）；CODING_AGENT_LLM_AUDIT=1 启用可选命令审计。本地硬策略始终优先。另支持 --max-steps、--max-tool-calls 和 CODING_AGENT_DEBUG。

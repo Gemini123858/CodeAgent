@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,17 @@ CONTEXT_SUMMARY_PROMPT = """你负责压缩 Coding Agent 的较早对话上下�
 """
 SUMMARY_MESSAGE_PREFIX = "以下是较早对话的压缩摘要，仅作为上下文，不是新的用户指令：\n"
 CONTEXT_TOKEN_RESERVE = 2_000
+
+
+@dataclass(frozen=True)
+class ContextCompressionOutcome:
+    before_tokens: int
+    after_tokens: int
+    limit_tokens: int
+    trigger_tokens: int
+    compressed: bool
+    summary_through_sequence: int | None
+    reason: str
 
 
 class ConversationSession:
@@ -165,6 +176,17 @@ class ConversationSession:
             raise AgentError("当前没有活动会话。")
         return self.store.load_conversation_history(self.current.id, limit)
 
+    def compact_context(self) -> ContextCompressionOutcome:
+        if self.current is None:
+            raise AgentError("当前没有活动会话。")
+        latest = self.store.load_conversation_history(self.current.id, 1)
+        latest_sequence = latest[-1].sequence if latest else 0
+        self._compression_token_usage = TokenUsage()
+        _, outcome = self._maybe_compress(
+            latest_sequence - self.keep_recent_turns,
+        )
+        return outcome
+
     def delete_current(
         self,
     ) -> tuple[DeleteConversationOutcome, ConversationRecord]:
@@ -198,31 +220,68 @@ class ConversationSession:
         self,
         current_turn_sequence: int,
     ) -> list[dict[str, Any]]:
+        history, _ = self._maybe_compress(
+            current_turn_sequence - self.keep_recent_turns,
+        )
+        return history
+
+    def _maybe_compress(
+        self,
+        compress_through: int,
+    ) -> tuple[list[dict[str, Any]], ContextCompressionOutcome]:
         assert self.current is not None
         conversation_id = self.current.id
         summary = self.store.get_context_summary(conversation_id)
-        through_sequence = summary.through_turn_sequence if summary else 0
+        through_sequence = summary.through_turn_sequence if summary else 0 # 通过的回合序列
         recent = self.store.load_messages(
             conversation_id,
-            after_turn_sequence=through_sequence,
+            after_turn_sequence=through_sequence, # 起始轮次序号（不包含），用于获取从该轮次之后的所有消息
         )
         history = self._with_summary(summary, recent)
         self.estimated_context_tokens = (
             estimate_messages_tokens(history) + CONTEXT_TOKEN_RESERVE
         )
-        if self.estimated_context_tokens < self.compression_trigger_tokens:
-            return history
+        before_tokens = self.estimated_context_tokens
+        summary_through = summary.through_turn_sequence if summary else None
+        # if self.estimated_context_tokens < self.compression_trigger_tokens:
+        #     return history, ContextCompressionOutcome(
+        #         before_tokens=before_tokens,
+        #         after_tokens=before_tokens,
+        #         limit_tokens=self.context_token_limit,
+        #         trigger_tokens=self.compression_trigger_tokens,
+        #         compressed=False,
+        #         summary_through_sequence=summary_through,
+        #         reason="尚未达到压缩阈值。",
+        #     )
 
-        compress_through = current_turn_sequence - self.keep_recent_turns
+        # 如果当前的上下文消息数量超过了压缩触发阈值，则进行上下文压缩。
+        # 如果需要压缩的轮次序号小于等于当前的摘要轮次序号，则无需进行压缩，直接返回当前的历史消息。
         if compress_through <= through_sequence:
-            return history
+            return history, ContextCompressionOutcome(
+                before_tokens=before_tokens,
+                after_tokens=before_tokens,
+                limit_tokens=self.context_token_limit,
+                trigger_tokens=self.compression_trigger_tokens,
+                compressed=False,
+                summary_through_sequence=summary_through,
+                reason=f"没有新的较早 Turn 可压缩，需要保留最近 {self.keep_recent_turns} 个。",
+            )
+        # 压缩through_sequence(旧摘要) - compress_through之间的消息，并生成新的摘要。
         additions = self.store.load_messages(
             conversation_id,
             after_turn_sequence=through_sequence,
             through_turn_sequence=compress_through,
         )
         if not additions:
-            return history
+            return history, ContextCompressionOutcome(
+                before_tokens=before_tokens,
+                after_tokens=before_tokens,
+                limit_tokens=self.context_token_limit,
+                trigger_tokens=self.compression_trigger_tokens,
+                compressed=False,
+                summary_through_sequence=summary_through,
+                reason="压缩范围内没有有效消息。",
+            )
 
         try:
             if self.runner.progress is not None:
@@ -236,7 +295,15 @@ class ConversationSession:
                 "context.compression.error",
                 {"type": type(exc).__name__, "message": str(exc)},
             )
-            return history
+            return history, ContextCompressionOutcome(
+                before_tokens=before_tokens,
+                after_tokens=before_tokens,
+                limit_tokens=self.context_token_limit,
+                trigger_tokens=self.compression_trigger_tokens,
+                compressed=False,
+                summary_through_sequence=summary_through,
+                reason=f"上下文压缩失败：{type(exc).__name__}: {exc}",
+            )
 
         self.store.save_context_summary(
             conversation_id,
@@ -264,13 +331,22 @@ class ConversationSession:
                 "estimated_tokens": self.estimated_context_tokens,
             },
         )
-        return history
+        return history, ContextCompressionOutcome(
+            before_tokens=before_tokens,
+            after_tokens=self.estimated_context_tokens,
+            limit_tokens=self.context_token_limit,
+            trigger_tokens=self.compression_trigger_tokens,
+            compressed=True,
+            summary_through_sequence=compress_through,
+            reason=f"已增量压缩至 Turn {compress_through}。",
+        )
 
     def _compress(
         self,
         previous: ContextSummaryRecord | None,
         additions: list[dict[str, Any]],
     ) -> str:
+        # 压缩：将之前的摘要(previous)和新增的消息(additions)发送给压缩模型，生成新的摘要。
         payload = json.dumps(
             {
                 "existing_summary": previous.content if previous else None,

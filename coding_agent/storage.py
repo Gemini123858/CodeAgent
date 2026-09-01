@@ -79,7 +79,7 @@ class DeleteConversationOutcome:
 @dataclass(frozen=True)
 class ContextSummaryRecord:
     conversation_id: str
-    through_turn_sequence: int
+    through_turn_sequence: int # 通过的回合序列
     content: str
 
 
@@ -267,6 +267,7 @@ class SessionStore:
         self,
         conversation_id: str,
     ) -> ContextSummaryRecord | None:
+    # 从数据库中获取指定会话的上下文摘要记录。如果找不到对应的记录，返回 None。
         row = self.connection.execute(
             "SELECT * FROM context_summaries WHERE conversation_id = ?",
             (conversation_id,),
@@ -489,9 +490,10 @@ class SessionStore:
         conversation_id: str,
         *,
         after_turn_sequence: int = 0,
-        through_turn_sequence: int | None = None,
+        through_turn_sequence: int | None = None, # 返回的消息轮次序号上限（包含），如果为 None，则返回所有消息
     ) -> list[dict[str, Any]]:
         # 从数据库中加载指定会话的所有消息，按顺序返回一个包含消息内容的列表。查询会排除状态为“interrupted”的轮次，以确保只获取完整的消息记录。如果消息的 JSON 数据损坏，将抛出 StorageError 异常。
+        # 返回 turn_sequence 大于 after_turn_sequence 且小于等于 through_turn_sequence 的消息。如果 through_turn_sequence 为 None，则返回所有消息。
         parameters: list[Any] = [conversation_id, after_turn_sequence]
         upper_bound = ""
         if through_turn_sequence is not None:
